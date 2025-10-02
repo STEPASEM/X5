@@ -2,6 +2,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
 from torch.optim import AdamW
 from transformers import AutoTokenizer, AutoModelForTokenClassification
 from sklearn.model_selection import train_test_split
@@ -11,8 +12,6 @@ import numpy as np
 
 
 class SearchQueryDataset(Dataset):
-    """Датасет для поисковых запросов с NER разметкой"""
-
     def __init__(self, queries, annotations, tokenizer, max_len, tag2id, is_test=False):
         self.queries = queries
         self.annotations = annotations if not is_test else [None] * len(queries)
@@ -26,26 +25,28 @@ class SearchQueryDataset(Dataset):
 
     def __getitem__(self, item):
         query = str(self.queries[item])
-
-        # Создаем символьные метки для каждого символа в запросе
         char_labels = ['O'] * len(query)
 
         if not self.is_test:
             annotation = self.annotations[item]
             for annot in annotation:
-                if len(annot) == 3:  # Проверяем формат (start, end, tag)
+                if len(annot) == 3:
                     start, end, tag = annot
-                    # Обеспечиваем корректные индексы
                     start = max(0, min(start, len(query) - 1))
                     end = max(start + 1, min(end, len(query)))
 
+                    # Убеждаемся, что правильно создаем B- и I- теги
                     char_labels[start] = tag
-                    # Помечаем внутренние части сущности как I-*
                     for i in range(start + 1, end):
-                        inner_tag = tag.replace('B-', 'I-')
+                        # Правильно создаем I-* теги
+                        if tag.startswith('B-'):
+                            inner_tag = 'I-' + tag[2:]
+                        elif tag.startswith('I-'):
+                            inner_tag = tag  # Уже I- тег
+                        else:
+                            inner_tag = 'I-' + tag  # Если нет префикса
                         char_labels[i] = inner_tag
 
-        # Токенизация с учетом выравнивания
         encoding = self.tokenizer(
             query,
             max_length=self.max_len,
@@ -55,15 +56,13 @@ class SearchQueryDataset(Dataset):
             return_tensors='pt',
         )
 
-        # Сопоставляем символьные метки с токенами
         labels = []
         offset_mapping = encoding['offset_mapping'].squeeze()
 
         for i, offset in enumerate(offset_mapping):
-            if offset[0] == 0 and offset[1] == 0:  # Специальные токены
+            if offset[0] == 0 and offset[1] == 0:
                 labels.append(-100)
             else:
-                # Берем метку первого символа токена
                 char_index = offset[0]
                 if char_index < len(char_labels):
                     label = char_labels[char_index]
@@ -116,6 +115,26 @@ class NERModel:
 
         return train_df
 
+    def check_tag_distribution(self, train_df):
+        """Проверка распределения тегов в данных"""
+        tag_counts = {}
+
+        for annotation in train_df['annotation']:
+            try:
+                list_of_annots = ast.literal_eval(annotation)
+                for annot in list_of_annots:
+                    if len(annot) == 3:
+                        tag = annot[2]
+                        tag_counts[tag] = tag_counts.get(tag, 0) + 1
+            except:
+                continue
+
+        print("\nРаспределение тегов в обучающих данных:")
+        for tag, count in sorted(tag_counts.items(), key=lambda x: x[1], reverse=True):
+            print(f"  {tag}: {count}")
+
+        return tag_counts
+
     def create_data_loaders(self, train_df, batch_size=16, val_size=0.2):
         """Создание DataLoader для обучения и валидации"""
         # Преобразуем аннотации
@@ -161,10 +180,10 @@ class NERModel:
         self.model.to(self.device)
 
     def train(self, train_loader, val_loader, epochs=3, learning_rate=2e-5):
-        """Обучение модели"""
+        """Обучение с mixed precision и валидацией"""
         optimizer = AdamW(self.model.parameters(), lr=learning_rate)
+        scaler = GradScaler()  # Только для GPU
 
-        print("Начало обучения...")
         for epoch in range(epochs):
             # Обучение
             self.model.train()
@@ -173,35 +192,70 @@ class NERModel:
             for batch_idx, batch in enumerate(train_loader):
                 optimizer.zero_grad()
 
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                labels = batch['labels'].to(self.device)
+                input_ids = batch['input_ids'].to(self.device, non_blocking=True)
+                attention_mask = batch['attention_mask'].to(self.device, non_blocking=True)
+                labels = batch['labels'].to(self.device, non_blocking=True)
 
-                outputs = self.model(
-                    input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
-                loss = outputs.loss
+                # Mixed precision forward pass
+                with autocast():
+                    outputs = self.model(
+                        input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels
+                    )
+                    loss = outputs.loss
 
-                loss.backward()
-                optimizer.step()
+                # Scaled backward pass
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
                 total_loss += loss.item()
 
-                if batch_idx % 50 == 0:
+                if batch_idx % 100 == 0:
                     print(f'Epoch {epoch + 1}, Batch {batch_idx}, Loss: {loss.item():.4f}')
 
             avg_train_loss = total_loss / len(train_loader)
 
-            # Валидация
+            # ВАЛИДАЦИЯ после каждой эпохи
             val_loss, val_f1 = self.validate(val_loader)
 
             print(f'Epoch {epoch + 1}/{epochs}:')
             print(f'  Train Loss: {avg_train_loss:.4f}')
             print(f'  Val Loss: {val_loss:.4f}')
             print(f'  Val F1: {val_f1:.4f}')
+
+            # Детальная информация о тегах
+            self._print_tag_statistics(val_loader)
             print('-' * 50)
+
+    def _print_tag_statistics(self, val_loader):
+        """Печать статистики по тегам"""
+        self.model.eval()
+        tag_counts = {tag: 0 for tag in self.tag2id.keys() if tag != 'O'}
+
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                labels = batch['labels'].to(self.device)
+
+                outputs = self.model(input_ids, attention_mask=attention_mask)
+                predictions = torch.argmax(outputs.logits, dim=2)
+
+                for i in range(len(labels)):
+                    mask = labels[i] != -100
+                    pred_labels = predictions[i][mask].cpu().numpy()
+
+                    for pred in pred_labels:
+                        tag = self.id2tag[pred]
+                        if tag != 'O':
+                            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+        print("Статистика предсказанных тегов:")
+        for tag, count in tag_counts.items():
+            if count > 0:
+                print(f"  {tag}: {count}")
 
     def validate(self, val_loader):
         """Валидация модели"""
@@ -247,7 +301,7 @@ class NERModel:
         return avg_loss, f1
 
     def predict_single(self, query):
-        """Предсказание для одного запроса"""
+        """Исправленная логика предсказания с поддержкой I-* тегов"""
         if self.model is None or self.tokenizer is None:
             raise ValueError("Модель не инициализирована. Сначала вызовите initialize_model()")
 
@@ -278,18 +332,27 @@ class NERModel:
 
         for i, (pred_idx, offset) in enumerate(zip(predictions, offset_mapping)):
             if offset[0] == 0 and offset[1] == 0:  # Специальные токены
+                # Если была активная сущность, сохраняем её
+                if current_entity is not None:
+                    entities.append({
+                        'start': int(start_idx),
+                        'end': int(prev_offset[1]),
+                        'entity': current_tag,
+                        'text': query[int(start_idx):int(prev_offset[1])]
+                    })
+                    current_entity = None
                 continue
 
             tag = self.id2tag[pred_idx]
 
             if tag.startswith('B-'):
-                # Сохраняем предыдущую сущность
+                # Сохраняем предыдущую сущность если есть
                 if current_entity is not None:
                     entities.append({
-                        'start': start_idx,
-                        'end': prev_offset[1],
+                        'start': int(start_idx),
+                        'end': int(prev_offset[1]),
                         'entity': current_tag,
-                        'text': query[start_idx:prev_offset[1]]
+                        'text': query[int(start_idx):int(prev_offset[1])]
                     })
 
                 # Начинаем новую сущность
@@ -297,89 +360,82 @@ class NERModel:
                 start_idx = offset[0]
                 current_tag = tag
 
-            elif tag.startswith('I-') and current_entity is not None:
-                # Проверяем, что это продолжение той же сущности
-                if current_tag and tag[2:] == current_tag[2:]:
-                    continue  # Просто продолжаем
+            elif tag.startswith('I-'):
+                if current_entity is not None and current_tag and tag[2:] == current_tag[2:]:
+                    # Продолжаем текущую сущность - НИЧЕГО НЕ ДЕЛАЕМ, просто продолжаем
+                    pass
                 else:
-                    # Разные сущности - сохраняем текущую и начинаем новую
+                    # Если нет активной сущности или другая сущность, начинаем новую
                     if current_entity is not None:
                         entities.append({
-                            'start': start_idx,
-                            'end': prev_offset[1],
+                            'start': int(start_idx),
+                            'end': int(prev_offset[1]),
                             'entity': current_tag,
-                            'text': query[start_idx:prev_offset[1]]
+                            'text': query[int(start_idx):int(prev_offset[1])]
                         })
-                    current_entity = None
+                    # Начинаем новую сущность с I- тега как B- тег
+                    current_entity = []
+                    start_idx = offset[0]
+                    current_tag = 'B-' + tag[2:]  # Преобразуем I- в B-
 
-            else:  # 'O' или другая сущность
+            else:  # 'O'
                 if current_entity is not None:
                     entities.append({
-                        'start': start_idx,
-                        'end': prev_offset[1],
+                        'start': int(start_idx),
+                        'end': int(prev_offset[1]),
                         'entity': current_tag,
-                        'text': query[start_idx:prev_offset[1]]
+                        'text': query[int(start_idx):int(prev_offset[1])]
                     })
                     current_entity = None
 
             prev_offset = offset
 
-        # Добавляем последнюю сущность
+        # Добавляем последнюю сущность если есть
         if current_entity is not None:
             entities.append({
-                'start': start_idx,
-                'end': offset[1],
+                'start': int(start_idx),
+                'end': int(offset[1]),
                 'entity': current_tag,
-                'text': query[start_idx:offset[1]]
+                'text': query[int(start_idx):int(offset[1])]
             })
 
         return entities
 
     def predict_csv(self, test_csv_path, output_csv_path=None):
-        """Предсказание для CSV файла"""
+        """Предсказание для CSV файла с правильным форматом"""
         print(f"Загрузка тестовых данных из {test_csv_path}...")
-        # Читаем CSV с правильным разделителем
         test_df = pd.read_csv(test_csv_path, sep=';')
 
         results = []
         print("Выполнение предсказаний...")
 
         for idx, row in test_df.iterrows():
-            query = str(row['sample'])  # Изменено с 'search_query' на 'sample'
+            query = str(row['sample'])
             entities = self.predict_single(query)
 
-            # Форматируем в требуемый формат BIO
+            # Форматируем в правильный формат - преобразуем numpy типы в Python int
             bio_annotation = []
             for entity in entities:
                 bio_annotation.append((
-                    entity['start'],
-                    entity['end'],
+                    int(entity['start']),  # Преобразуем в Python int
+                    int(entity['end']),  # Преобразуем в Python int
                     entity['entity']
                 ))
 
-            # Сохраняем результат с правильными названиями колонок
+            # Сохраняем результат
             result = {
                 'sample': query,
-                'annotation': str(bio_annotation)  # Сохраняем как строку
+                'annotation': str(bio_annotation)  # Будет выглядеть как [(0, 3, 'B-BRAND')]
             }
 
-            # Если есть ID, сохраняем его
             if 'id' in row:
                 result['id'] = row['id']
 
             results.append(result)
 
-            # Вывод в консоль
-            print(f"\nЗапрос {idx + 1}: '{query}'")
-            print("Сущности:")
-            for entity in entities:
-                print(f"  {entity['entity']}: '{entity['text']}' (позиции {entity['start']}-{entity['end']})")
-            print("-" * 60)
-
         # Сохранение результатов
         if output_csv_path:
             output_df = pd.DataFrame(results)
-            # Сохраняем с тем же разделителем, что и исходный файл
             output_df.to_csv(output_csv_path, index=False, sep=';')
             print(f"\nРезультаты сохранены в {output_csv_path}")
 
@@ -422,13 +478,13 @@ class NERModel:
 def main():
     """Основная функция"""
     # Параметры
-    MODEL_NAME = 'distilbert-base-multilingual-cased'  # Используем предобученную модель
-    TRAIN_CSV = 'train.csv'  # Используем ваш файл как обучающие данные
-    TEST_CSV = 'submission.csv'  # Тестируем на другом файле
-    MAX_LEN = 64
-    BATCH_SIZE = 16
-    EPOCHS = 3
-    LEARNING_RATE = 2e-5
+    MODEL_NAME = 'cointegrated/rubert-tiny2'  # Более легкая и быстрая модель
+    TRAIN_CSV = 'train.csv'
+    TEST_CSV = 'submission.csv'
+    MAX_LEN = 128
+    BATCH_SIZE = 32
+    EPOCHS = 5
+    LEARNING_RATE = 3e-5
 
     # Инициализация модели
     ner_model = NERModel(model_name=MODEL_NAME, max_len=MAX_LEN)
@@ -436,6 +492,12 @@ def main():
     try:
         # Подготовка данных
         train_df = ner_model.prepare_data(TRAIN_CSV)
+        ner_model.check_tag_distribution(train_df)
+        print(f"Всего данных: {len(train_df)}")
+
+        # Используем 80% данных
+        train_df = train_df.sample(frac=0.8, random_state=42)
+        print(f"Используется для обучения: {len(train_df)}")
 
         # Создание DataLoader
         train_loader, val_loader = ner_model.create_data_loaders(
@@ -462,31 +524,7 @@ def main():
     try:
         ner_model.predict_csv(TEST_CSV, 'submission_predictions.csv')
     except FileNotFoundError:
-        print(f"Файл {TEST_CSV} не найден. Запускаем демо-предсказания...")
-
-        # Демо-предсказания на примерах
-        demo_queries = [
-            "форма для выпечки",
-            "фарш свиной",
-            "сок ананасовый без сахара",
-            "еринги",
-            "молооко"
-        ]
-
-        print("\nДемо-предсказания:")
-        print("=" * 60)
-
-        for i, query in enumerate(demo_queries):
-            entities = ner_model.predict_single(query)
-            print(f"\nЗапрос {i + 1}: '{query}'")
-            print("Обнаруженные сущности:")
-
-            if entities:
-                for entity in entities:
-                    print(f"  {entity['entity']}: '{entity['text']}' (позиции {entity['start']}-{entity['end']})")
-            else:
-                print("  Сущности не обнаружены")
-            print("-" * 40)
+        print(f"Файл {TEST_CSV} не найден.")
 
 
 if __name__ == "__main__":

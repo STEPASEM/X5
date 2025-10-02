@@ -1,19 +1,51 @@
+<!DOCTYPE html>
 <html>
 <head>
     <title>Search</title>
     {% load django_bootstrap5 %}
     {% bootstrap_css %}
+    {% bootstrap_javascript %}
 </head>
 <body>
     <div class="container-fluid">
-    <div class="row justify-content-center">
-        <div class="col-12">
-            <form style="margin-top: 100px;">
-                {{ form.as_p }}
-                <input type="submit" value="Search" class="btn btn-primary w-100">
-            </form>
+        <div class="row justify-content-center">
+            <div class="col-12 col-md-8 col-lg-6">
+                <!-- Форма с правильным action -->
+                <form method="POST" action="" style="margin-top: 100px;" id="searchForm">
+                    {% csrf_token %}
+                    {{ form.as_p }}
+                    <input type="submit" value="Search" class="btn btn-primary w-100" id="submitBtn">
+                </form>
+
+                <!-- Блок для отображения результатов -->
+                <div id="results" style="margin-top: 30px;">
+                    {% if results %}
+                        <div class="card">
+                            <div class="card-header">
+                                <h5 class="card-title mb-0">Результат для: "{{ results.query }}"</h5>
+                            </div>
+                            <div class="card-body">
+                                {% if results.entities %}
+                                    <h6>Обнаруженные сущности:</h6>
+                                    {% for entity in results.entities %}
+                                        <div class="alert alert-light border">
+                                            <span class="badge bg-primary me-2">{{ entity.entity }}</span>
+                                            <strong>"{{ entity.text }}"</strong>
+                                            <small class="text-muted">(позиции {{ entity.start }}-{{ entity.end }})</small>
+                                        </div>
+                                    {% endfor %}
+                                    <p class="mt-3"><strong>Формат аннотации:</strong><br><code>{{ results.formatted_annotation }}</code></p>
+                                {% elif results.error %}
+                                    <div class="alert alert-danger">
+                                        <strong>Ошибка:</strong> {{ results.error }}
+                                    </div>
+                                {% else %}
+                                    <div class="alert alert-warning">Сущности не обнаружены</div>
+                                {% endif %}
+                            </div>
+                        </div>
+                    {% endif %}
+                </div>
+            </div>
         </div>
     </div>
-    </div>
-</body>
-</html>

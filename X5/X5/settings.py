@@ -11,11 +11,14 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 from pathlib import Path
+import os
 
 from django.conf.global_settings import TEMPLATES
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+MODEL_DIR = os.path.join(BASE_DIR, 'trained_ner_model')
 
 
 # Quick-start development settings - unsuitable for production
@@ -27,7 +30,11 @@ SECRET_KEY = 'django-insecure-8=2#mi-+9omx845tiqu3ytse6k*ko2!x-d=7mk)7^%4c__c!hx
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+# Разрешить все хосты для тестирования
+ALLOWED_HOSTS = ['*']
+
+# Для больших JSON запросов
+DATA_UPLOAD_MAX_MEMORY_SIZE = 10485760  # 10MB
 
 
 # Application definition
