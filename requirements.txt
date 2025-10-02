@@ -1,11 +1,13 @@
 asgiref==3.9.1
 certifi==2025.8.3
 charset-normalizer==3.4.3
+click==8.3.0
 colorama==0.4.6
 Django==5.2.6
 django-bootstrap5==25.2
 filelock==3.19.1
 fsspec==2025.9.0
+h11==0.16.0
 hf-xet==1.1.10
 huggingface-hub==0.35.1
 idna==3.10
@@ -37,3 +39,4 @@ transformers==4.56.2
 typing_extensions==4.15.0
 tzdata==2025.2
 urllib3==2.5.0
+uvicorn==0.37.0
